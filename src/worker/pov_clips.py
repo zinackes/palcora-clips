@@ -39,7 +39,7 @@ from worker.limits import (
     CLIP_RUN_UP_S,
     CLIPS_PER_PASS,
 )
-from worker.storage import INFREQUENT, ClipWindow
+from worker.storage import ClipWindow
 
 log = logging.getLogger(__name__)
 
@@ -394,12 +394,13 @@ def anchors(connection: Connection, vods: list[str]) -> set[str]:
 
 
 def storage_class(vod_id: str, broadcast: Set[str]) -> str | None:
-    """Standard pour le broadcast (lu par les aperçus), accès peu fréquent sinon.
+    """Toujours le standard (docs/plans/stockage-video.md, item 8).
 
-    Un co-stream n'est relu qu'après l'expiration de sa VOD
-    (docs/plans/stockage-video.md).
+    L'accès peu fréquent n'a pas de quota gratuit et R2 facture ses opérations
+    par million entamé : quelques milliers d'envois coûtaient 9 $ par mois pour
+    0,22 $ d'économie de stockage.
     """
-    return None if vod_id in broadcast else INFREQUENT
+    return None
 
 
 def _record(
@@ -504,18 +505,19 @@ class Reclassed:
     failed: int = 0
 
 
-def to_infrequent(
+def reclass(
     connection: Connection,
     storage: Reclassing,
     *,
+    target: str,
     apply: bool,
     time_left: Callable[[], float] | None = None,
 ) -> Reclassed:
-    """Passe en accès peu fréquent les extraits des co-streams encore en standard.
+    """Passe les extraits des co-streams dans la classe `target`.
 
-    À blanc (`apply=False`), compte seulement. Un extrait déjà passé n'est pas
-    recopié : la copie relirait ses octets, et cette relecture se paie. On peut
-    donc relancer après une coupure.
+    À blanc (`apply=False`), compte seulement. Un extrait déjà dans la classe
+    n'est pas recopié : la copie relirait ses octets, et cette relecture se
+    paie. On peut donc relancer après une coupure.
     """
     report = Reclassed()
     cursor = connection.execute(_COSTREAM_CLIPS)
@@ -524,11 +526,11 @@ def to_infrequent(
             break
         key = clip_key(str(vod_id), int(start), int(duration))
         try:
-            if storage.storage_class_of(key) == INFREQUENT:
+            if storage.storage_class_of(key) == target:
                 report.already += 1
                 continue
             if apply:
-                storage.set_storage_class(key, INFREQUENT)
+                storage.set_storage_class(key, target)
         except Exception as error:  # noqa: BLE001 — un extrait raté n'arrête pas les autres
             log.warning("extrait %s : classe inchangée (%s)", key, error)
             report.failed += 1

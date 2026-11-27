@@ -399,3 +399,98 @@ def storage_from_env() -> Store:
         access_key_id=os.environ["R2_ACCESS_KEY_ID"],
         secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
     )
+
+
+# Les teasers de l'affiche de la landing (audit du 27/11, P1-12) : 6 s en
+# 720p autour du cœur de l'action, ~1 Mo, au lieu du moment entier en 1080p
+# (20,5 Mo téléchargés par visite sur ordinateur). `previews/<id>.teaser.mp4`,
+# noté `signals.preview.teaser` (sa durée). Tiré de la vidéo déjà dans R2 :
+# l'aperçu, ou l'extrait du broadcast qui le couvre ; aucune VOD.
+TEASER_S = 6
+TEASER_HEIGHT = 720
+TEASER_ARGS = (
+    "-c:v", "libx264", "-crf", "28", "-preset", "slow",
+    "-maxrate", "1500k", "-bufsize", "3000k", "-g", "60", "-pix_fmt", "yuv420p",
+)  # fmt: skip
+
+_TEASERS_PENDING = """
+SELECT m.id::text, m.start_s, m.end_s, m.signals->'preview'->'clip',
+  (m.signals->'preview'->>'duration_s')::float
+FROM discovered_moments m
+WHERE m.signals ? 'preview' AND NOT (m.signals->'preview' ? 'teaser')
+  AND COALESCE((m.signals->'preview'->>'version')::int, 1) >= 2
+  AND (%(events)s::uuid[] IS NULL OR m.event_id = ANY(%(events)s::uuid[]))
+  -- Une part du rattrapage : plusieurs conteneurs, aucun moment en double.
+  AND mod(abs(hashtext(m.id::text)), %(shards)s) = %(shard)s
+ORDER BY m.created_at DESC, m.id
+LIMIT %(limit)s
+"""
+
+_MARK_TEASER = """
+UPDATE discovered_moments SET signals = jsonb_set(signals, '{preview,teaser}', %(s)s)
+WHERE id = %(id)s AND signals ? 'preview'
+"""
+
+
+def teaser_key(moment_id: str) -> str:
+    return f"previews/{moment_id}.teaser.mp4"
+
+
+def teaser_source(
+    moment_id: str, start_s: float, end_s: float, clip: object, length_s: float | None
+) -> tuple[str, float]:
+    """La clé R2 de la vidéo à lire et l'instant (dans cette vidéo) où le
+    teaser commence : 3 s avant l'image de l'aperçu (45 % du moment)."""
+    length = min(max(0.0, end_s - start_s), length_s or PREVIEW_MAX_S)
+    within = max(0.0, min(0.45 * length - TEASER_S / 2, length - TEASER_S))
+    if isinstance(clip, Mapping) and {"vod", "start_s", "duration_s"} <= clip.keys():
+        from worker.pov_clips import clip_key
+
+        key = clip_key(str(clip["vod"]), int(clip["start_s"]), int(clip["duration_s"]))
+        return key, start_s - float(clip["start_s"]) + within
+    return preview_keys(moment_id)[1], within
+
+
+def teaser_command(source: str, at_s: float, out: Path) -> list[str]:
+    return [
+        "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+        *_input_guard(source), "-ss", f"{at_s:.3f}", "-i", source, "-t", str(TEASER_S),
+        "-an", "-vf", f"scale=-2:min(ih\\,{TEASER_HEIGHT}),fps=30",
+        *TEASER_ARGS, "-movflags", "+faststart", str(out),
+    ]  # fmt: skip
+
+
+class SignedStore(Store, Protocol):
+    def signed_url(self, key: str, expires_s: int = 900) -> str: ...
+
+
+def teasers(
+    connection: Connection,
+    storage: SignedStore,
+    *,
+    events: Iterable[str] | None = None,
+    limit: int = 500,
+    shard: int = 0,
+    shards: int = 1,
+) -> tuple[int, int]:
+    """Fait les teasers qui manquent (la part `shard` sur `shards`) ; rend
+    (faits, ratés)."""
+    wanted = list(events) if events is not None else None
+    cursor = connection.execute(
+        _TEASERS_PENDING, {"events": wanted, "limit": limit, "shard": shard, "shards": shards}
+    )
+    done = failed = 0
+    for moment_id, start_s, end_s, clip, length in cursor.fetchall():  # type: ignore[attr-defined]
+        key, at = teaser_source(moment_id, float(start_s), float(end_s), clip, length)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / "teaser.mp4"
+                _run(teaser_command(storage.signed_url(key), at, out))
+                storage.upload(out, teaser_key(moment_id))
+        except Exception as error:  # noqa: BLE001 — un teaser raté n'arrête pas les autres
+            log.warning("teaser %s raté : %s", moment_id, error)
+            failed += 1
+            continue
+        connection.execute(_MARK_TEASER, {"id": moment_id, "s": Jsonb(TEASER_S)})
+        done += 1
+    return done, failed

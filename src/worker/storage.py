@@ -27,7 +27,7 @@ _RENDER_KEY = re.compile(
 # Les aperçus des moments publiés (worker.moment_previews) : l'id du moment ;
 # `.sm.jpg` est la vignette des grilles (plan alleger-pages).
 _PREVIEW_KEY = re.compile(
-    r"previews/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(jpg|sm\.jpg|mp4)\Z"
+    r"previews/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(jpg|sm\.jpg|mp4|teaser\.mp4)\Z"
 )
 # Les extraits gardés des POV (worker.pov_clips) : la VOD et sa fenêtre, comme
 # `raw/`, mais sans expiration par âge (docs/plans/moments-chez-nous.md).
@@ -296,6 +296,33 @@ class R2Storage:
             Params={"Bucket": self.bucket, "Key": self.validate_key(key)},
             ExpiresIn=expires_s,
         )
+
+    def clip_keys(self, platform: str, vod_id: str) -> Iterator[str]:
+        """Les objets gardés d'une VOD (`clips/<plateforme>/<vod>/`) : extraits et sous-titres."""
+        token: str | None = None
+        prefix = f"{ClipWindow(platform, vod_id, 0, 1).key.rsplit('/', 1)[0]}/"
+        while True:
+            kwargs: dict[str, object] = {"Bucket": self.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            page = self.client.list_objects_v2(**kwargs)
+            for entry in page.get("Contents", []):
+                if isinstance(entry, dict) and isinstance(entry.get("Key"), str):
+                    yield str(entry["Key"])
+            if not page.get("IsTruncated"):
+                return
+            next_token = page.get("NextContinuationToken")
+            if not isinstance(next_token, str) or not next_token or next_token == token:
+                raise RuntimeError("Invalid R2 listing continuation token")
+            token = next_token
+
+    def delete(self, key: str) -> None:
+        """Efface un objet gardé (extrait ou sous-titre) : le retrait d'une chaîne
+        (`worker.takedown`). Les autres préfixes ont leur ramasse-miettes."""
+        validated = self.validate_key(key)
+        if not (_CLIP_KEY.fullmatch(validated) or _SUBTITLE_KEY.fullmatch(validated)):
+            raise ValueError("Only kept clips and their subtitles are deleted here")
+        self.client.delete_object(Bucket=self.bucket, Key=validated)
 
     def render_objects(self) -> Iterator[tuple[str, datetime]]:
         token: str | None = None

@@ -5,6 +5,7 @@ tenir en même temps (audit H15). Un appel au-delà attend son tour au lieu
 d'allumer une machine de plus.
 """
 
+from dataclasses import dataclass
 from datetime import timedelta
 
 from worker.discovery.recordings import MAX_PARALLEL as RECORDINGS_IN_PARALLEL
@@ -31,6 +32,8 @@ MODAL_MAX_CONTAINERS: dict[str, int] = {
     # Les sous-titres des extraits (docs/plans/sous-titres.md) : un GPU par
     # conteneur ; quatre à la fois pour le rattrapage, le reste attend.
     "clip_subtitles": 4,
+    # La passe de nuit des sous-titres : un seul lanceur, sans GPU.
+    "nightly_subtitles": 1,
     # Les clips TikTok (docs/plans/clips-tiktok.md) : lancés à la main, par lot.
     "tiktok_clip": 4,
     "verify_vods": 1,
@@ -38,6 +41,8 @@ MODAL_MAX_CONTAINERS: dict[str, int] = {
     "discover_sweep": 1,
     "refresh_calendar": 1,
     "lolesports_ids": 1,
+    # L'état de la chaîne (worker/health.py) : une passe à la fois.
+    "pipeline_health": 1,
     "read_lolesports_league": 1,
     "youtube_replays": 1,
     "youtube_align": 1,
@@ -54,6 +59,11 @@ MODAL_MAX_CONTAINERS: dict[str, int] = {
 HEARTBEAT_MAX_FAILURES = 3
 # Délai de connexion à Postgres, en secondes, pour toute connexion du worker.
 DB_CONNECT_TIMEOUT_S = 10
+# Délai de `refresh_calendar`, en secondes. Liquipedia impose 2 s entre deux
+# requêtes : une première lecture des 65 pages de `infra/schedule.json`
+# (révisions, brackets, logos) a dépassé 600 s le 26/11/2026. Les passes
+# suivantes ne relisent que les pages changées et restent bien en dessous.
+CALENDAR_TIMEOUT_S = 1800
 
 # Un extrait YouTube demandé par un rendu (plan `streamers-fr.md`, item 15) :
 # l'agent du PC passe toutes les 15 min ; le rendu l'attend au plus 20 min,
@@ -97,6 +107,28 @@ MATCH_GAME_DURATION = timedelta(minutes=75)
 MISSING_MOMENTS_AFTER = timedelta(hours=12)
 MISSING_MOMENTS_SPAN = timedelta(hours=2)
 
+# Une analyse : six heures de la VOD de référence au plus, le broadcast et
+# onze co-streamers (`docs/plans/plus-de-pov.md`, item 2). Au-delà de huit, la
+# mesure passe en deux vagues sur les huit cœurs ; seize n'a pas été mesuré
+# contre le budget. Un montage garde, lui, huit POV au plus.
+MAX_ANALYSIS_S = 6 * 3600
+MAX_ANALYSIS_SOURCES = 12
+
+# L'analyse automatique des matchs finis (docs/plans/analyses-auto.md) : un
+# match s'analyse une demi-heure après sa fin estimée, s'il a été joué dans
+# les 14 derniers jours (les VOD Twitch vivent 60 j). Deux analyses du compte
+# de publication à la fois, une lancée par passe, 120 par mois (~0,06–0,23 $
+# chacune), deux essais par match. Un co-stream compte s'il couvre la moitié
+# de la fenêtre.
+AUTO_ANALYZE_SETTLE = timedelta(minutes=30)
+AUTO_ANALYZE_LOOKBACK = timedelta(days=14)
+AUTO_ANALYZE_ACTIVE = 2
+AUTO_ANALYZE_PER_PASS = 1
+AUTO_ANALYZE_PER_MONTH = 120
+AUTO_ANALYZE_ATTEMPTS = 2
+AUTO_ANALYZE_MIN_COVERAGE = 0.5
+AUTO_ANALYZE_CANDIDATES = 20
+
 # L'extrait d'un moment publié (worker.moment_previews, version 2) : le moment
 # entier, borné ici. Les moments durent 39 s en médiane, 99 s au plus (25/11).
 PREVIEW_MAX_S = 120.0
@@ -129,6 +161,15 @@ SUBTITLE_LANGUAGES: tuple[str, ...] = ("en", "fr", "es", "ko")
 # Extraits traités par appel de la fonction Modal : ~1 min d'audio chacun, quelques
 # secondes de GPU, plus les appels de traduction.
 SUBTITLES_PER_PASS = 200
+# Extraits traités en même temps sur un GPU. Profil du 27/11 (L4) : par extrait,
+# ~5 s de téléchargements, ~6 s d'envois et ~8 s de traduction pour 1,2 s de
+# Whisper ; à la suite, le GPU attendait. Whisper reste un à la fois.
+SUBTITLE_CLIPS_AT_ONCE = 6
+# La passe de nuit (accord de Mathys du 27/11) : les extraits coupés depuis deux
+# jours, au plus mille (~35 min de GPU) ; ceux déjà faits ne coûtent qu'une
+# lecture sur R2. Le PC coupe ~400 extraits par nuit jusqu'à mi-décembre.
+SUBTITLES_NIGHTLY_HOURS = 48
+SUBTITLES_NIGHTLY_LIMIT = 1000
 # Le GPU de la transcription : faster-whisper turbo en float16 y passe une
 # minute d'audio en quelques secondes. Délai et marge comme pour `pov_clips`.
 SUBTITLES_GPU = "L4"
@@ -142,3 +183,22 @@ TIKTOK_MIN_S = 15.0
 TIKTOK_MAX_S = 25.0
 TIKTOK_PAD_S = 1.0
 MIN_SOURCE_H = 720
+
+
+@dataclass(frozen=True)
+class HealthLimits:
+    """L'alerte de la chaîne (worker/health.py, audit du 27/11, P0-10) : au-delà
+    de ces âges ou de ces taux, un message part ; il est rappelé toutes les
+    `repeat` tant qu'il dure."""
+
+    discovery_stale: timedelta = timedelta(hours=2)
+    calendar_stale: timedelta = timedelta(hours=12)
+    intake_stale: timedelta = timedelta(hours=24)
+    clips_min_tries: int = 20
+    clips_failure_rate: float = 0.10
+    expiry_warning_days: int = 7
+    analyses_failed: int = 3
+    repeat: timedelta = timedelta(hours=12)
+
+
+HEALTH = HealthLimits()
