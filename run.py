@@ -48,6 +48,18 @@ def from_env_file(text: str, keys: Sequence[str]) -> dict[str, str]:
     return found
 
 
+def to_cut(connection: object, vods: list[str]) -> int:
+    """Les extraits encore à couper sur ces VOD (fenêtres abandonnées exclues)."""
+    from worker import pov_clips
+
+    if not vods:
+        return 0
+    wanted = pov_clips.pending(connection, vods, 1_000_000)  # type: ignore[arg-type]
+    made, given_up = pov_clips._known(connection, vods)  # type: ignore[arg-type]
+    windows = pov_clips.missing(wanted, made, given_up=given_up)
+    return sum(len(w) for w in windows.values())
+
+
 def _mask(env: dict[str, str]) -> None:
     """Les journaux d'un dépôt public sont publics : cacher l'hôte de la base."""
     host = urlsplit(env["DATABASE_URL"]).hostname
@@ -92,11 +104,14 @@ def main(argv: list[str] | None = None) -> int:
     with psycopg.connect(database, autocommit=True, **KEEPALIVE) as connection:
         every = pov_clips.pending_vods(connection, PENDING_VODS)
     vods = shard_of(every, args.shard, args.shards)
+    with psycopg.connect(database, autocommit=True, **KEEPALIVE) as connection:
+        todo = to_cut(connection, vods)
     if args.clips:
         vods = vods[: args.workers]
     print(
         f"job {args.shard + 1}/{args.shards} · {os.cpu_count()} fils · {args.workers} VOD à la "
-        f"fois · preset {args.preset} · {len(vods)} VOD sur {len(every)} en attente",
+        f"fois · preset {args.preset} · {len(vods)} VOD sur {len(every)} en attente · "
+        f"{todo} extraits à couper dans ce job",
         flush=True,
     )
     tally = Tally()
@@ -142,7 +157,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"FIN : {summary}", flush=True)
     if path := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(path, "a", encoding="utf-8") as out:
-            out.write(f"job {args.shard + 1}/{args.shards} : {summary}\n")
+            out.write(
+                f"job {args.shard + 1}/{args.shards} : {summary} · {todo} à couper au départ\n"
+            )
     return 0
 
 
