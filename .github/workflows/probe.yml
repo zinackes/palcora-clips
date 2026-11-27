@@ -1,0 +1,46 @@
+# Compares the system ffmpeg with a recent static build on one Twitch VOD
+# window. No secrets: the VOD is public and nothing is written anywhere.
+name: probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      vod:
+        description: "Twitch VOD id"
+        required: true
+        default: "2909583295"
+      start:
+        description: "Window start, in seconds of the VOD"
+        required: true
+        default: "6153"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+          pipx install -q yt-dlp
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz | tar xJ
+          mv ffmpeg-n7.1-*/bin ff7
+      - name: compare
+        env:
+          VOD: ${{ inputs.vod }}
+          START: ${{ inputs.start }}
+        run: |
+          url=$(yt-dlp -g -f 'best[height<=1080]' "https://www.twitch.tv/videos/$VOD")
+          for ff in /usr/bin/ffmpeg ./ff7/ffmpeg; do
+            echo "== $($ff -version | head -1)"
+            start=$(date +%s)
+            timeout 420 $ff -nostdin -y -loglevel warning -protocol_whitelist https,tls,tcp,crypto \
+              -ss "$START" -i "$url" -ss 10 -t 30 -vf 'scale=-2:min(ih\,1080),fps=30' \
+              -c:v libx264 -preset faster -crf 23 -c:a aac out.mp4 2>&1 | tail -5 || true
+            echo "seconds: $(( $(date +%s) - start ))"
+            ffprobe -v error -show_entries stream=codec_type,height:format=duration -of compact out.mp4 || true
+            rm -f out.mp4
+          done
