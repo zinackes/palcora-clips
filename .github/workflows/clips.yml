@@ -1,0 +1,77 @@
+# Les extraits gardés, coupés sur les runners gratuits d'un dépôt public.
+# Seulement par cron ou à la main : jamais sur une PR (dépôt public, secrets).
+name: clips
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      clips:
+        description: "Essai : N extraits par job puis stop (vide = tout)"
+        required: false
+        default: ""
+      shards:
+        description: "Jobs en parallèle (20 au plus sur un compte gratuit)"
+        required: false
+        default: "20"
+      hours:
+        description: "Durée maximale par job, en heures (6 h au plus)"
+        required: false
+        default: "5.5"
+
+permissions:
+  contents: read
+
+# Un seul lot à la fois : deux runs ne coupent pas les mêmes VOD.
+concurrency:
+  group: clips
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      shards: ${{ steps.s.outputs.shards }}
+    steps:
+      - id: s
+        env:
+          SHARDS: ${{ inputs.shards || '20' }}
+        run: |
+          n=$(( SHARDS > 20 ? 20 : (SHARDS < 1 ? 1 : SHARDS) ))
+          echo "shards=$(seq -s, 0 $((n-1)) | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+
+  cut:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+      - name: dépendances
+        run: uv venv -q && uv pip install -q -r requirements.txt
+      - name: extraits
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          PYTHONPATH: src
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
+          CLIPS: ${{ inputs.clips }}
+          HOURS: ${{ inputs.hours || '5.5' }}
+        run: |
+          args=(--shard "$SHARD" --shards "$SHARDS" --hours "$HOURS")
+          if [ -n "$CLIPS" ]; then args+=(--clips "$CLIPS"); fi
+          .venv/bin/python run.py "${args[@]}"

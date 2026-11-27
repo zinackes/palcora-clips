@@ -1,0 +1,7 @@
+# Les dépendances du seul découpage des extraits (apps/worker/pyproject.toml).
+# yt-dlp sans borne haute : Twitch casse souvent, la dernière version suit.
+psycopg[binary]>=3.2,<4
+boto3>=1.40,<2
+httpx>=0.27
+pydantic>=2.7
+yt-dlp>=2025.1.1
