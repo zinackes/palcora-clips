@@ -9,7 +9,9 @@ donc deux jobs ne coupent jamais la même VOD.
     python run.py --clips 4                         # essai
 
 Les clés viennent de l'environnement (secrets du dépôt) : DATABASE_URL,
-R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, chacune en
+secret, ou un `.env` collé entier dans le secret `MULTIPOV` (on n'en lit que
+ces cinq clés).
 """
 
 from __future__ import annotations
@@ -35,6 +37,17 @@ def shard_of(vods: Sequence[str], index: int, total: int) -> list[str]:
     return [vod for vod in vods if zlib.crc32(vod.encode()) % total == index]
 
 
+def from_env_file(text: str, keys: Sequence[str]) -> dict[str, str]:
+    """Les seules `keys` d'un `.env` collé en un secret (`MULTIPOV`), le reste ignoré."""
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        name, sep, value = line.strip().removeprefix("export ").partition("=")
+        name = name.strip()
+        if sep and name in keys and not name.startswith("#"):
+            found[name] = value.strip().strip("'\"")
+    return found
+
+
 def _mask(env: dict[str, str]) -> None:
     """Les journaux d'un dépôt public sont publics : cacher l'hôte de la base."""
     host = urlsplit(env["DATABASE_URL"]).hostname
@@ -54,7 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    env = {key: os.environ.get(key, "") for key in KEYS}
+    pasted = from_env_file(os.environ.get("MULTIPOV", ""), KEYS)
+    env = {key: os.environ.get(key) or pasted.get(key, "") for key in KEYS}
     missing = [key for key in KEYS if not env[key]]
     if missing:
         print("MANQUE dans les secrets du dépôt : " + ", ".join(missing), file=sys.stderr)
