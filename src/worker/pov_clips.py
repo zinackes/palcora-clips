@@ -25,6 +25,7 @@ import logging
 import math
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Mapping, Set
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,7 +159,7 @@ def missing(
 
 
 def clip_command(
-    source: str, start_s: int, duration_s: int, out: Path, preset: str = moment_previews.PRESET
+    source: str, start_s: float, duration_s: int, out: Path, preset: str = moment_previews.PRESET
 ) -> list[str]:
     # Les réglages vidéo de l'aperçu (1080p au plus, 30 i/s, débit plafonné),
     # plus le son du streamer : c'est tout ce qui restera de sa VOD.
@@ -195,13 +196,58 @@ def _probe(path: Path) -> tuple[int, float]:
     return int(read["streams"][0]["height"]), float(read["format"]["duration"])
 
 
+Fetch = Callable[[str, float, float, Path], tuple[Path, float]]
+"""Tire les segments d'une fenêtre : (playlist, début, fin, dossier) → (fichier, son début)."""
+
+
+def fetch_segments(source: str, start_s: float, end_s: float, workdir: Path) -> tuple[Path, float]:
+    """Les seuls segments HLS de la fenêtre, init fMP4 compris, dans un fichier local.
+
+    ffmpeg ne sait pas sauter au milieu d'une VOD Twitch servie en fMP4 : il lit
+    depuis le début (27/11/2026, runner GitHub : 20 min sans une image pour
+    20 s à 1 h 40, « aucune image lue » ou délai dépassé sur 27 % des fenêtres).
+    `ingest.hls` connaît l'init et les segments `-muted` ; c'est lui qui tire.
+    """
+    import httpx
+
+    from worker.ingest import hls
+
+    deadline = time.monotonic() + COMMAND_TIMEOUT_S
+    out = workdir / "segments.mp4"
+    with httpx.Client(follow_redirects=False) as client:
+        playlist = hls.fetch_playlist(client, source, deadline=deadline)
+        try:
+            first = hls.fetch_window(
+                client, source, playlist, start_s, end_s, out, deadline=deadline
+            )
+        except hls.WindowOutOfRange as error:
+            raise TooShort(f"la VOD finit avant la fenêtre : {error}") from error
+    return out, first
+
+
 def cut(
-    source: str, start_s: int, duration_s: int, workdir: Path, preset: str = moment_previews.PRESET
+    source: str,
+    start_s: int,
+    duration_s: int,
+    workdir: Path,
+    preset: str = moment_previews.PRESET,
+    *,
+    fetch: Fetch = fetch_segments,
 ) -> Made:
-    """Coupe la fenêtre dans `workdir` ; refuse un extrait plus court que demandé."""
+    """Coupe la fenêtre dans `workdir` ; refuse un extrait plus court que demandé.
+
+    Une playlist distante est d'abord réduite aux segments de la fenêtre
+    (`fetch`), puis coupée en local ; un fichier local se coupe tel quel.
+    """
     out = workdir / f"{start_s}-{duration_s}.mp4"
+    begin: float = start_s
+    if source.startswith("https://"):
+        local, first = fetch(
+            source, max(0.0, start_s - CLIP_RUN_UP_S), start_s + duration_s, workdir
+        )
+        source, begin = str(local), round(start_s - first, 3)
     done = subprocess.run(  # noqa: S603 — liste d'arguments, jamais de shell
-        clip_command(source, start_s, duration_s, out, preset),
+        clip_command(source, begin, duration_s, out, preset),
         capture_output=True, text=True, timeout=COMMAND_TIMEOUT_S, check=False,
     )  # fmt: skip
     if done.returncode != 0 or not out.exists() or out.stat().st_size == 0:
