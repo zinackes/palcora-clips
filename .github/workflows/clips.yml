@@ -59,13 +59,6 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
       - name: dépendances
         run: uv venv -q && uv pip install -q -r requirements.txt
-      - name: secrets
-        # Names only, never values: tells a missing secret from a misplaced one.
-        env:
-          ALL_SECRETS: ${{ toJSON(secrets) }}
-          ALL_VARS: ${{ toJSON(vars) }}
-        run: |
-          python3 -c 'import json,os; print("secrets:", sorted(json.loads(os.environ["ALL_SECRETS"]))); print("variables:", sorted(json.loads(os.environ["ALL_VARS"])))'
       - name: extraits
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
